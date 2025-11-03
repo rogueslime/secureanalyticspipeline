@@ -1,0 +1,134 @@
+{
+  "engine_version": "1.0",
+  "description": "Policy engine for transforming ops.* to anl.* with privacy-preserving rules.",
+  "on_schema_change": {
+    "new_column_behavior": "fail"
+  },
+  "globals": {
+    "hash_salt_source": "env",
+    "hash_salt_env_var": "USER_HASH_SALT",
+    "date_key_format": "%Y%m%d"
+  },
+  "transforms": {
+    "sha256_salted": {
+      "type": "hash",
+      "algo": "sha256",
+      "salt_concat_format": "{salt}:{value}"
+    },
+    "sha256": {
+      "type": "hash",
+      "algo": "sha256"
+    },
+    "age_bin": {
+      "type": "case",
+      "cases": [
+        { "when": "years < 18",   "then": "<18" },
+        { "when": "18 <= years <= 24", "then": "18-24" },
+        { "when": "25 <= years <= 34", "then": "25-34" },
+        { "when": "35 <= years <= 44", "then": "35-44" },
+        { "when": "45 <= years <= 64", "then": "45-64" },
+        { "when": "years >= 65",  "then": "65+" }
+      ],
+      "years_expr_mysql": "TIMESTAMPDIFF(YEAR, {col}, CURDATE())"
+    },
+    "prefix3": {
+      "type": "substring",
+      "start": 1,
+      "length": 3
+    },
+    "date_key": {
+      "type": "dateformat",
+      "format": "%Y%m%d",
+      "mysql_expr": "CAST(DATE_FORMAT({col}, '%Y%m%d') AS UNSIGNED)"
+    }
+  },
+  "pipelines": [
+    {
+      "name": "users_to_dim_customer",
+      "source": "ops.users",
+      "emit_to": "anl.dim_customer",
+      "columns": {
+        "user_id":        { "action": "hash", "using": "sha256_salted", "emit_as": "user_hash" },
+        "email":          { "action": "hash", "using": "sha256",        "emit_as": "email_token" },
+        "phone_number":   { "action": "remove" },
+        "full_name":      { "action": "remove" },
+        "dob":            { "action": "transform", "using": "age_bin",  "emit_as": "age_bin" },
+        "street_address": { "action": "remove" },
+        "city":           { "action": "keep" },
+        "state":          { "action": "keep" },
+        "zipcode":        { "action": "transform", "using": "prefix3",  "emit_as": "zipcode_prefix" },
+        "signup_ts":      { "action": "transform", "using": "date_key", "emit_as": "signup_date_key" },
+        "last_login_ts":  { "action": "remove" }
+      },
+      "keys": {
+        "surrogate_key": "customer_key",
+        "natural_keys": ["user_id"]
+      },
+      "uniqueness": ["user_hash"]
+    },
+    {
+      "name": "products_to_dim_product",
+      "source": "ops.products",
+      "emit_to": "anl.dim_product",
+      "columns": {
+        "product_id":   { "action": "keep" },
+        "sku":          { "action": "keep" },
+        "name":         { "action": "keep" },
+        "category":     { "action": "keep" },
+        "price_cents":  { "action": "ignore" }
+      },
+      "keys": {
+        "surrogate_key": "product_key",
+        "natural_keys": ["product_id"]
+      },
+      "uniqueness": ["product_id"]
+    },
+    {
+      "name": "orders_items_to_fact_order_line",
+      "source": "ops.orders",
+      "joins": [
+        { "with": "ops.order_items", "on": ["order_id"] }
+      ],
+      "emit_to": "anl.fact_order_line",
+      "columns": {
+        "order_id":         { "action": "keep" },
+        "order_ts":         { "action": "transform", "using": "date_key", "emit_as": "date_key" },
+        "user_id":          { "action": "hash", "using": "sha256_salted", "emit_as": "user_hash" },
+        "ops.order_items.product_id": { "action": "alias", "emit_as": "product_id" },
+        "ops.order_items.quantity":   { "action": "alias", "emit_as": "quantity" },
+        "ops.order_items.unit_price_cents": { "action": "alias", "emit_as": "unit_price_cents" },
+        "tax_cents":        { "action": "keep" },
+        "discount_cents":   { "action": "keep" },
+        "shipping_cents":   { "action": "keep" },
+        "status":           { "action": "keep" }
+      },
+      "computed": {
+        "revenue_cents": { "expression": "quantity * unit_price_cents" }
+      },
+      "dim_mappings": {
+        "customer_key": { "lookup": "anl.dim_customer", "on": { "user_hash": "user_hash" } },
+        "product_key":  { "lookup": "anl.dim_product",  "on": { "product_id": "product_id" } }
+      },
+      "fact_pk": ["order_id", "product_key"]
+    }
+  ],
+  "guards": {
+    "k_anonymity": {
+      "enabled": false,
+      "groups": ["age_bin", "zipcode_prefix"],
+      "k_min": 20,
+      "on_violation": "suppress"
+    }
+  },
+  "validation": {
+    "require_emitted_columns_exist": true,
+    "require_unique_targets": true
+  },
+  "render_mysql": {
+    "hash_salted_expr": "SHA2(CONCAT('{salt}', {col}), 256)",
+    "hash_expr": "SHA2({col}, 256)",
+    "age_years_expr": "TIMESTAMPDIFF(YEAR, {col}, CURDATE())",
+    "prefix3_expr": "LEFT(COALESCE({col}, ''), 3)",
+    "date_key_expr": "CAST(DATE_FORMAT({col}, '%Y%m%d') AS UNSIGNED)"
+  }
+}
